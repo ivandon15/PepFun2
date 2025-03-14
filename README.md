@@ -1,7 +1,7 @@
 # PepFun 2.0
 ## Fix Recording
 Searching the dates for more details.
-- 250314 version: focused on NNAA mutation parts
+- 250314 version: supports N-modifcation/thio-amide and other complex NNAA mutation.
 ## Open protocols for peptide analysis
 
 * From publication "PepFun 2.0: improved protocols for the analysis of natural and modified peptides"
