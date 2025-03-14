@@ -34,13 +34,20 @@ from modeller.automodel import *
 from Bio.Align import PairwiseAligner
 from Bio.PDB.Polypeptide import is_aa
 from Bio.Data.SCOPData import protein_letters_3to1 as aa3to1
-from Bio.PDB import PDBIO
-from Bio.PDB import PDBParser
-from Bio.PDB import NeighborSearch
+from Bio.PDB import PDBIO, PDBParser, NeighborSearch
 from Bio.PDB.Atom import Atom
 from Bio.PDB.Residue import Residue
 from Bio.PDB.vectors import Vector, rotaxis, calc_dihedral, calc_angle
 
+import collections
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from collections import deque
+
+BB_SMRT = "[N:1][C:2][C:3](=[O:4])[O:5]"
+BB_ATOMS = ['N', 'CA', 'C', 'O', 'OXT']
+BBS_SMRT = "[N:1][C:2][C:3](=[S:4])[O:5]"
+BBS_ATOMS = ['N', 'CA', 'C', 'S', 'OXT']
 ########################################################################################
 # Classes and functions
 ########################################################################################
@@ -396,7 +403,7 @@ class Capping:
 
 class Mutation:
 
-    def __init__(self, pdb_file, chainID, pepPosition, pdbNNAA, chainNNAA, nnaa_name):
+    def __init__(self, pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA=None, mutated_file=None):
         '''
         Class to mutate a NNAA in a position of a natural AA
 
@@ -404,6 +411,7 @@ class Mutation:
         :param chainID: chain ID of the peptide
         :param pepPosition: position on the peptide that will be mutated
         :param pdbNNAA: PDB file of the NNAA used in the mutation
+        :param smilesNNAA: if NNAA's smiles is provided, then generate and save in pdbNNAA
         :param chainNNAA: chain of the NNAA PDB file
         :param nnaa_name: abbreviated name of the NNAA
         '''
@@ -412,8 +420,11 @@ class Mutation:
         self.chainID = chainID
         self.pepPosition = pepPosition
         self.pdbNNAA = pdbNNAA
-        self.chainNNAA = chainNNAA
+        self.smilesNNAA = smilesNNAA
+        self.chainNNAA = "A"
         self.nnaa_name = nnaa_name
+        self.mutated_file = "mutated_{}.pdb".format(self.nnaa_name) if not mutated_file else mutated_file
+        self.BBS_FLG = False
 
     ########################################################################################
 
@@ -433,6 +444,12 @@ class Mutation:
         # Inititalize variables
         rad = 180.0 / math.pi
         flagCap = False
+        
+        # deal with HETAM
+        resid_map = {}
+        for i,res in enumerate(chain):
+            resid_map[i] = res.get_id()
+
         for i,res in enumerate(chain):
             # First residue
             if i == 0:
@@ -445,7 +462,7 @@ class Mutation:
                     n = N_curr.get_vector()
                     ca = CA_curr.get_vector()
 
-                    N_next = chain[i+2]["N"]
+                    N_next = chain[resid_map[i + 1]]["N"]
                     n_next = N_next.get_vector()
 
                     psi = calc_dihedral(n, ca, c, n_next)
@@ -504,8 +521,8 @@ class Mutation:
                     c = C_curr.get_vector()
                     n = N_curr.get_vector()
                     ca = CA_curr.get_vector()
-
-                    N_next = chain[i + 2]["N"]
+                    # print("resid_map[i + 2], raw:", resid_map[i + 1], i + 2)
+                    N_next = chain[resid_map[i + 1]]["N"]
                     n_next = N_next.get_vector()
 
                     # Calculate dihedral
@@ -514,7 +531,7 @@ class Mutation:
 
                     # Store the data for the position of interest
                     if self.pepPosition == i+1:
-                        print('The dihedrals for residue {}{} are: Phi ({}) - Psi ({})'.format(res.get_resname(), self.pepPosition, phi * rad, psi * rad))
+                        # print('The dihedrals for residue {}{} are: Phi ({}) - Psi ({})'.format(res.get_resname(), self.pepPosition, phi * rad, psi * rad))
                         self.ref_psi = psi * rad
                         self.ref_phi = phi * rad
 
@@ -535,93 +552,405 @@ class Mutation:
             print("Failed to map the backbone dihedrals. Check the input variables")
 
     ########################################################################################
+    # HACK
+    def check_clashes(self, pdb_file, chain_id, distance_threshold=2.1):
+        '''
+        Check for clashes between atoms in a specified chain and other atoms in the structure.
 
+        :param pdb_file: Path to the PDB file of the structure.
+        :param chain_id: ID of the chain to check for clashes.
+        :param distance_threshold: Distance threshold to define a clash (default: 2.1 Å).
+        :return: List of clash pairs, where each pair contains the residue number and atom name of the clashing atoms.
+        '''
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("protein", pdb_file)
+        model = structure[0]
+
+        atom_list = list(model.get_atoms())
+        key_atoms = [atom for atom in atom_list if atom.get_id()[0] != 'H']
+
+        ns = NeighborSearch(key_atoms)
+
+        def is_backbone(atom_name):
+            return atom_name in ["N", "CA", "C", "O"]
+        
+        clash_pairs = []
+        for chain in model:
+            if chain.id != chain_id:
+                continue  
+            for residue in chain:
+                for atom in residue:
+                    if is_backbone(atom.get_name()):
+                        continue
+                    if atom.get_id()[0] == 'H':
+                        continue
+                    neighbors = ns.search(atom.coord, distance_threshold)
+
+                    for neighbor in neighbors:
+                        if neighbor.get_parent() == residue:
+                            continue
+                        clash_pairs.append([(residue.id[1], atom.get_name()), (neighbor.get_parent().id[1], neighbor.get_name())])
+        return clash_pairs
+
+
+    def get_connect(self, pdbfile):
+        '''
+        Extract CONECT lines from the NNAA PDB file.
+
+        :return: List of CONECT lines from the NNAA PDB file.
+        '''
+        conect_lines = []
+        with open(pdbfile, "r") as f:
+            for line in f:
+                if line.startswith("CONECT"):
+                    conect_lines.append(line)
+        return conect_lines
+
+
+    def add_connect(self, mutated_pdb_file):
+        '''
+        Add CONECT lines from the NNAA PDB file to the mutated PDB file.
+
+        :param mutated_pdb_file: Path to the mutated PDB file where CONECT lines will be added.
+        :return: None. The CONECT lines are appended to the mutated PDB file.
+        '''
+        parser = PDBParser()
+        reference = parser.get_structure('REF', mutated_pdb_file)
+        model = reference[0]
+        chain = model[self.chainID]
+        conect_lines = self.get_connect(self.pdbNNAA)
+        atom_idx_map = {}        
+        for i, res in enumerate(chain):
+            if self.pepPosition == i + 1:
+                for atom in res.get_atoms():
+                    atom_idx_map[self.name2wtidx[atom.get_id()]] = atom.serial_number
+        
+        updated_conect_lines = []
+        for line in conect_lines:
+            parts = line.split()
+            new_parts = [parts[0]]
+            
+            for atom_id in parts[1:]:
+                new_id = atom_idx_map.get(int(atom_id), ' ')
+                new_parts.append(str(new_id))
+                
+            updated_conect_lines.append(" ".join(new_parts))
+
+        with open(mutated_pdb_file, 'a') as f:
+            for conect in updated_conect_lines:
+                f.write(conect + '\n')
+
+
+    def generate_conformer(self, smiles):
+        """
+        Generate a 3D conformer for a molecule from its SMILES string.
+
+        Arguments:
+        :param smiles: SMILES string of the molecule.
+        :return: RDKit Mol object with embedded 3D coordinates.
+        """
+        mol = Chem.MolFromSmiles(smiles)
+        mol = Chem.AddHs(mol)
+
+        ps = AllChem.ETKDGv2()
+        id = AllChem.EmbedMolecule(mol, ps)
+        if id == -1:
+            # use random coords
+            ps.useRandomCoords = True
+            AllChem.EmbedMolecule(mol, ps)
+            AllChem.MMFFOptimizeMolecule(mol, confId=0)
+        return mol
+    
+
+    def _atomidx2atomname(self, mol, keep_existing_names=False):
+        """
+        Map atom indices to atom names for a molecule.
+
+        Arguments:
+        :param mol: RDKit Mol object representing the molecule.
+        :param keep_existing_names: If True, preserve existing atom names; otherwise, generate new names.
+        :return: A dictionary mapping atom indices to atom names.
+        """
+        mol = Chem.Mol(mol)
+        backbone =  Chem.MolFromSmarts(BB_SMRT) 
+        backbone_idxes = mol.GetSubstructMatches(backbone)
+        bb_atoms = BB_ATOMS
+        if not backbone_idxes:
+            backbone =  Chem.MolFromSmarts(BBS_SMRT) 
+            backbone_idxes = mol.GetSubstructMatches(backbone)
+            bb_atoms = BBS_ATOMS
+            self.BBS_FLG = True
+
+        backbone_idxes = backbone_idxes[0]
+        backbone_map = dict(zip(backbone_idxes, bb_atoms))
+        origin_new_name_map = {}
+        element_counts = collections.Counter()
+        for atom in mol.GetAtoms():
+            if not atom.HasProp('atom_name') or not keep_existing_names:
+                atom_idx = atom.GetIdx()
+                if atom_idx in backbone_map.keys():
+                    new_name = backbone_map[atom_idx]
+                else:
+                    element = atom.GetSymbol()
+                    element_counts[element] += 1
+                    new_name = f'{element}{element_counts[element]}'
+                origin_new_name_map[atom_idx+1] = new_name
+        return origin_new_name_map
+    
+
+    def rename_pdb(self, input_pdb, output_pdb, mol, aa_name):
+        """
+        Rename atoms in a PDB file based on a provided index-to-name mapping.
+
+        Arguments:
+        :param input_pdb: Path to the input PDB file.
+        :param output_pdb: Path to the output PDB file.
+        :param mol: Mol object need to rename
+        :param aa_name: Amino acid name to be added to the PDB file.
+        :return: None
+        """
+        idx_map = self._atomidx2atomname(mol)
+
+        with open(input_pdb, "r") as f_in, open(output_pdb, "w") as f_out:
+            for line in f_in:
+                if line.startswith("HETATM") or line.startswith("ATOM"):
+                    atom_idx = int(line[6:11].strip())
+                    if atom_idx in idx_map:
+                        new_atom_name = idx_map[atom_idx].ljust(4)[:4]
+                        line = line[:13] + new_atom_name + aa_name.ljust(4)[:4] + "A" + line[22:]
+                f_out.write(line)
+
+
+    def smiles2pdb(self, smiles, pdbNNAA, nnaa_name):
+        """
+        Convert a SMILES string to a PDB file with renamed atoms.
+
+        Arguments:
+        :param smiles: SMILES string of the molecule.
+        :param aa_name: Amino acid name to be added to the PDB file.
+        :param pdb_file: Path to the output PDB file.
+        :return: None
+        """
+        mol = self.generate_conformer(smiles)
+        tmp_pdb_file = pdbNNAA.replace(".","tmp.")
+        Chem.MolToPDBFile(mol, tmp_pdb_file)
+        self.rename_pdb(tmp_pdb_file, pdbNNAA, mol, nnaa_name)
+        os.remove(tmp_pdb_file)
+
+
+    def find_connected_atoms(self, res, start_atom_name, stop_atom_names, ns):
+        """
+        Find all atoms connected to start_atom_name using BFS, stopping at stop_atom_names.
+        Record the order in which atoms are traversed and the edges (pairs of connected atoms).
+
+        :param res: The residue object (Bio.PDB.Residue).
+        :param start_atom_name: The name of the starting atom.
+        :param stop_atom_names: A set of atom names at which to stop traversal.
+        :param ns: NeighborSearch object for finding connected atoms.
+        :return: A tuple containing:
+                - A list of atom names in the order they were traversed.
+                - A list of tuples representing edges (pairs of connected atoms).
+        """
+        # Initialize BFS queue with the starting atom
+        queue = deque()
+        queue.append(start_atom_name)
+
+        # Set to track visited atoms
+        visited = set()
+
+        # List to store the order of traversal
+        traversal_order = []
+
+        # List to store the edges (pairs of connected atoms)
+        edges = []
+
+        while queue:
+            current_atom_name = queue.popleft()
+
+            # Skip if already visited or if it's a stop atom
+            if current_atom_name in visited or current_atom_name in stop_atom_names:
+                continue
+
+            # Mark the current atom as visited
+            visited.add(current_atom_name)
+            traversal_order.append(current_atom_name)
+
+            # Get the current atom object
+            if current_atom_name not in res:
+                continue
+            current_atom = res[current_atom_name]
+
+            # Find connected atoms
+            connected_atoms_list = ns.search(current_atom.coord, 2.0)
+            connected_names = {atom.get_id() for atom in connected_atoms_list if atom.get_id() != current_atom_name}
+
+            # Add connected atoms to the queue and record edges
+            for atom_name in connected_names:
+                if atom_name not in visited and atom_name not in stop_atom_names:
+                    queue.append(atom_name)
+                    edges.append((current_atom_name, atom_name))  # Record the edge
+
+        return traversal_order, edges
+
+
+    def has_multiple_paths_N_to_CA(self, residue):
+        """
+        Check if there are multiple paths between the N atom and the CA atom in a residue.
+
+        :param residue: A Bio.PDB.Residue object representing the residue.
+        :return: True if there are multiple paths, False otherwise.
+        """
+        # Get the N and CA atoms
+        n_atom = residue["N"]
+        ca_atom = residue["CA"]
+
+        # Initialize a NeighborSearch object to find bonded atoms
+        ns = NeighborSearch(list(residue.get_atoms()))
+
+        # Set to store visited atoms to avoid cycles
+        visited = set()
+
+        # Counter to track the number of unique paths
+        path_count = 0
+
+        def dfs(current_atom, target_atom, path):
+            nonlocal path_count
+            if current_atom == target_atom:
+                path_count += 1
+                if path_count > 1:
+                    return True  # Early exit if multiple paths are found
+                return False
+
+            visited.add(current_atom)
+            for neighbor in ns.search(current_atom.coord, 2.0):  # 2.0 Å is a typical bond cutoff
+                if neighbor not in visited and neighbor != current_atom:
+                    if dfs(neighbor, target_atom, path + [neighbor]):
+                        return True
+            visited.remove(current_atom)
+            return False
+
+        # Start DFS from N atom
+        dfs(n_atom, ca_atom, [n_atom])
+
+        # Return True if more than one path exists
+        return path_count > 1
+
+        
     def get_NNAA_basic_info(self):
-        '''
-        Function to capture all possible information from the NNAA pdb, including atoms, bonds, and structure parameters
-
-        :return: Lists and dictionaries with all the required parameters
-        '''
         # Input PDB information
         rad = 180.0 / math.pi
         parser = PDBParser()
+        if self.smilesNNAA:
+            self.smiles2pdb(self.smilesNNAA, self.pdbNNAA, self.nnaa_name)
+
         reference = parser.get_structure('REF', self.pdbNNAA)
         model = reference[0]
         chain = model[self.chainNNAA]
-
+        
         # Get all the atoms in the NNAA and store those that are not hydrogens
-        backbone_atoms = ("N", "O", "C", "OXT")
         atom_list = [x for x in model.get_atoms()]
-        key_atoms = []
-        atom_names = []
-        self.atom_order = []
-        for atom in atom_list:
-            if atom.get_id()[0] != 'H':
-                key_atoms.append(atom)
-                atom_names.append(atom.get_id())
-                if atom.get_id() not in backbone_atoms:
-                    self.atom_order.append(atom.get_id())
-        # Create an engine to look for bonds
-        ns = NeighborSearch(key_atoms)
-        _cutoff_dist = 2
-
-        # Loop to store the bonds
-
         self.bonds = []
         self.assoc_bonds = {}
-        for target in key_atoms:
-            name = target.get_id()
-            if name not in backbone_atoms:
-                close_atoms = ns.search(target.coord, _cutoff_dist)
-                for close_atom in close_atoms:
-                    name2 = close_atom.get_id()
-                    if name2 not in backbone_atoms and target != close_atom:
-                        if (name, name2) not in self.bonds and (name2, name) not in self.bonds:
-                            self.bonds.append((name,name2))
-                            self.assoc_bonds[name2]=name
+        self.name2wtidx = {atom.get_id(): i+1 for i, atom in enumerate(model.get_atoms())}
+        self.sidechain_atom_order = [] # sidechain
+        self.Nmod_atom_order = [] # N modification chain
+        key_atoms = [atom for atom in atom_list if atom.get_id()[0] != 'H']
+        ns = NeighborSearch(key_atoms)
+        for res in chain:
+            is_N2CA_cyclic = self.has_multiple_paths_N_to_CA(res)
+            if not is_N2CA_cyclic:
+                # eluminate cyclic situations
+                self.Nmod_atom_order, bonds = self.find_connected_atoms(res, "N", {"CA"}, ns)
+                if len(self.Nmod_atom_order) == 1:
+                    # no N modification
+                    self.Nmod_atom_order = []
+                else:
+                    self.bonds.extend(bonds)
+            self.sidechain_atom_order, bonds = self.find_connected_atoms(res, "CA", {"N", "C"}, ns)
+            if len(self.sidechain_atom_order) == 1:
+                # no sidechain
+                self.sidechain_atom_order = []
+            else:
+                self.bonds.extend(bonds)
+            break
+        for ele1, ele2 in self.bonds:
+            self.assoc_bonds[ele2] = ele1
 
         self.dict_NNAA = {}
-
         for bond in self.bonds:
-
             self.dict_NNAA[bond]={}
             ele1 = bond[0]
             ele2 = bond[1]
-            ind1 = self.atom_order.index(ele1)
-            # Exception
-            if ele1 != "CA" and self.assoc_bonds[ele1] == "CA":
-                ind1 = 1
+            if sorted(list(bond)) == sorted(["N", "CA"]):
+                # no need to consider
+                continue
+            if ele1 in self.sidechain_atom_order:
+                ind1 = self.sidechain_atom_order.index(ele1)
+                # Exception
+                if ele1 != "CA" and self.assoc_bonds[ele1] == "CA":
+                    ind1 = 1
+                for i,res in enumerate(chain):
 
-            for i,res in enumerate(chain):
-                if ind1 == 0:
-                    atom_1 = res["N"]
-                    atom_2 = res["C"]
-                    atom_3 = res[ele1]
-                    atom_4 = res[ele2]
-                elif ind1 == 1:
-                    atom_1 = res["N"]
-                    atom_2 = res[self.assoc_bonds[ele1]]
-                    atom_3 = res[ele1]
-                    atom_4 = res[ele2]
-                else:
-                    atom_1 = res[self.assoc_bonds[self.assoc_bonds[ele1]]]
-                    atom_2 = res[self.assoc_bonds[ele1]]
-                    atom_3 = res[ele1]
-                    atom_4 = res[ele2]
+                    if ind1 == 0:
+                        atom_1 = res["N"]
+                        atom_2 = res["C"]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
+                    elif ind1 == 1:
+                        atom_1 = res["N"]
+                        atom_2 = res[self.assoc_bonds[ele1]]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
+                    else:
+                        atom_1 = res[self.assoc_bonds[self.assoc_bonds[ele1]]]
+                        atom_2 = res[self.assoc_bonds[ele1]]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
 
-                atom1_vec = atom_1.get_vector()
-                atom2_vec = atom_2.get_vector()
-                atom3_vec = atom_3.get_vector()
-                atom4_vec = atom_4.get_vector()
+                    atom1_vec = atom_1.get_vector()
+                    atom2_vec = atom_2.get_vector()
+                    atom3_vec = atom_3.get_vector()
+                    atom4_vec = atom_4.get_vector()
 
-                length = atom_4 - atom_3
-                angle = calc_angle(atom2_vec, atom3_vec, atom4_vec) * rad
-                diangle = calc_dihedral(atom1_vec, atom2_vec, atom3_vec, atom4_vec) * rad
+                    length = atom_4 - atom_3
+                    angle = calc_angle(atom2_vec, atom3_vec, atom4_vec) * rad
+                    diangle = calc_dihedral(atom1_vec, atom2_vec, atom3_vec, atom4_vec) * rad
 
-                self.dict_NNAA[bond]={'length': length, 'angle': angle, 'diangle': diangle}
+                    self.dict_NNAA[bond]={'length': length, 'angle': angle, 'diangle': diangle}
+            else:
+                ind1 = self.Nmod_atom_order.index(ele1)
+                # Exception
+                if ele1 != "N" and self.assoc_bonds[ele1] == "N":
+                    ind1 = 1
+                for i,res in enumerate(chain):
 
+                    if ind1 == 0:
+                        atom_1 = res["CA"]
+                        atom_2 = res["C"]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
+                    elif ind1 == 1:
+                        atom_1 = res["CA"]
+                        atom_2 = res[self.assoc_bonds[ele1]]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
+                    else:
+                        atom_1 = res[self.assoc_bonds[self.assoc_bonds[ele1]]]
+                        atom_2 = res[self.assoc_bonds[ele1]]
+                        atom_3 = res[ele1]
+                        atom_4 = res[ele2]
+
+                    atom1_vec = atom_1.get_vector()
+                    atom2_vec = atom_2.get_vector()
+                    atom3_vec = atom_3.get_vector()
+                    atom4_vec = atom_4.get_vector()
+
+                    length = atom_4 - atom_3
+                    angle = calc_angle(atom2_vec, atom3_vec, atom4_vec) * rad
+                    diangle = calc_dihedral(atom1_vec, atom2_vec, atom3_vec, atom4_vec) * rad
+
+                    self.dict_NNAA[bond]={'length': length, 'angle': angle, 'diangle': diangle}
     ########################################################################################
-
     def assign_mutation(self):
         '''
         Function to assign the mutation based on the stored parameters
@@ -635,11 +964,14 @@ class Mutation:
         chain = model[self.chainID]
 
         for i, res in enumerate(chain):
+            # 遍历sequence
             if self.pepPosition == i + 1:
+                # 找到突变位置
                 C = res["C"]
                 N = res["N"]
                 CA = res["CA"]
-
+                # used for following connection information
+                res.id = ('H_', res.id[1], res.id[2])
                 # Delete the other atoms leaving only the atoms of the backbone
                 ids = []
                 for a in res:
@@ -647,64 +979,119 @@ class Mutation:
                     if atomId not in ("N", "CA", "O", "C"): ids.append(atomId)
                 for i in ids: res.detach_child(i)
 
-                res.resname = self.nnaa_name
-                atom_to_select = {'CA': CA}
-                for bond in self.bonds:
+                # deal with thio-amid
+                if self.BBS_FLG:
+                    O_atom = res["O"]
+                    S_atom = Atom(
+                        name="S",
+                        coord=O_atom.coord,
+                        bfactor=O_atom.bfactor,
+                        occupancy=O_atom.occupancy,
+                        altloc=O_atom.altloc,
+                        fullname=" S ",
+                        serial_number=O_atom.serial_number,
+                        element="S"  
+                    )
+                    res.detach_child("O")
+                    res.add(S_atom)
 
-                    # dict_NNAA[bond] = {}
+                res.resname = self.nnaa_name
+                atom_to_select = {'CA': CA, 'N': N}
+                for bond in self.bonds:
                     ele1 = bond[0]
                     ele2 = bond[1]
-                    ind1 = self.atom_order.index(ele1)
-                    if ele1 != "CA" and self.assoc_bonds[ele1] == "CA":
-                        ind1 = 1
-
-                    if ind1 == 0:
-
-                        atom_coord = calculateCoordinates(
-                                N, C, atom_to_select[ele1], self.dict_NNAA[bond]['length'], self.dict_NNAA[bond]['angle'],
-                                self.dict_NNAA[bond]['diangle']
-                        )
-                        atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
-                        if ele2 not in atom_to_select:
-                            atom_to_select[ele2] = atom_object
-                            res.add(atom_object)
-
-                    elif ind1 == 1:
-
-                        atom_coord = calculateCoordinates(
-                                N, atom_to_select[self.assoc_bonds[ele1]], atom_to_select[ele1],
-                                self.dict_NNAA[bond]['length'],
-                                self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
-                        )
-                        atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
-                        if ele2 not in atom_to_select:
-                            atom_to_select[ele2] = atom_object
-                            res.add(atom_object)
-
-                    else:
-                        atom_coord = calculateCoordinates(
-                                atom_to_select[self.assoc_bonds[self.assoc_bonds[ele1]]], atom_to_select[self.assoc_bonds[ele1]],
-                                atom_to_select[ele1], self.dict_NNAA[bond]['length'],
-                                self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
-                        )
-                        if ele2[0] not in ('C', 'N', 'O', 'S'):
-                            if ele2 == 'BRZ':
-                                ele2mod = 'BrZ'
-                            else:
-                                ele2mod = ele2
-                            atom_object = Atom(ele2mod, atom_coord, 0.0, 1.0, " ", " {}".format(ele2mod), 0,
-                                               ele2[0:len(ele2) - 1])
-                        else:
+                    if ele1 in self.sidechain_atom_order:
+                        ind1 = self.sidechain_atom_order.index(ele1)
+                        if ele1 != "CA" and self.assoc_bonds[ele1] == "CA":
+                            ind1 = 1
+                        if ind1 == 0:
+                            atom_coord = calculateCoordinates(
+                                    N, C, atom_to_select[ele1], self.dict_NNAA[bond]['length'], self.dict_NNAA[bond]['angle'],
+                                    self.dict_NNAA[bond]['diangle']
+                            )
                             atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
-                        if ele2 not in atom_to_select:
-                            atom_to_select[ele2] = atom_object
-                            res.add(atom_object)
-
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
+                        elif ind1 == 1:
+                            atom_coord = calculateCoordinates(
+                                    N, atom_to_select[self.assoc_bonds[ele1]], atom_to_select[ele1],
+                                    self.dict_NNAA[bond]['length'],
+                                    self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
+                            )
+                            atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
+                        else:
+                            atom_coord = calculateCoordinates(
+                                    atom_to_select[self.assoc_bonds[self.assoc_bonds[ele1]]], atom_to_select[self.assoc_bonds[ele1]],
+                                    atom_to_select[ele1], self.dict_NNAA[bond]['length'],
+                                    self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
+                            )
+                            if ele2[0] not in ('C', 'N', 'O', 'S'):
+                                if ele2 == 'BRZ':
+                                    ele2mod = 'BrZ'
+                                else:
+                                    ele2mod = ele2
+                                atom_object = Atom(ele2mod, atom_coord, 0.0, 1.0, " ", " {}".format(ele2mod), 0,
+                                                ele2[0:len(ele2) - 1])
+                            else:
+                                atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
+                    else:
+                        ind1 = self.Nmod_atom_order.index(ele1)
+                        if ele1 != "N" and self.assoc_bonds[ele1] == "N":
+                            ind1 = 1
+                        if ind1 == 0:
+                            atom_coord = calculateCoordinates(
+                                    CA, C, atom_to_select[ele1], self.dict_NNAA[bond]['length'], self.dict_NNAA[bond]['angle'],
+                                    self.dict_NNAA[bond]['diangle']
+                            )
+                            atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
+                        elif ind1 == 1:
+                            atom_coord = calculateCoordinates(
+                                    CA, atom_to_select[self.assoc_bonds[ele1]], atom_to_select[ele1],
+                                    self.dict_NNAA[bond]['length'],
+                                    self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
+                            )
+                            atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
+                        else:
+                            atom_coord = calculateCoordinates(
+                                    atom_to_select[self.assoc_bonds[self.assoc_bonds[ele1]]], atom_to_select[self.assoc_bonds[ele1]],
+                                    atom_to_select[ele1], self.dict_NNAA[bond]['length'],
+                                    self.dict_NNAA[bond]['angle'], self.dict_NNAA[bond]['diangle']
+                            )
+                            if ele2[0] not in ('C', 'N', 'O', 'S'):
+                                if ele2 == 'BRZ':
+                                    ele2mod = 'BrZ'
+                                else:
+                                    ele2mod = ele2
+                                atom_object = Atom(ele2mod, atom_coord, 0.0, 1.0, " ", " {}".format(ele2mod), 0,
+                                                ele2[0:len(ele2) - 1])
+                            else:
+                                atom_object = Atom(ele2, atom_coord, 0.0, 1.0, " ", " {}".format(ele2), 0, ele2[0])
+                            if ele2 not in atom_to_select:
+                                atom_to_select[ele2] = atom_object
+                                res.add(atom_object)
         # Saving the new structure
         io = PDBIO()
         io.set_structure(reference)
-        io.save("mutated_{}.pdb".format(self.nnaa_name))
-        print("The mutation has been generated for the NNAA: {}".format(self.nnaa_name))
+        io.save(self.mutated_file)
+        self.add_connect(self.mutated_file)
+        if Chem.MolFromPDBFile(self.mutated_file) is None:
+            raise Exception
+        clash_pairs = self.check_clashes(self.mutated_file, self.chainID)
+        if clash_pairs:
+            raise Exception
 
     # End of Mutation class
     ############################################################

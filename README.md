@@ -1,5 +1,7 @@
 # PepFun 2.0
-
+## Fix Recording
+Searching the dates for more details.
+- 250314 version: focused on NNAA mutation parts
 ## Open protocols for peptide analysis
 
 * From publication "PepFun 2.0: improved protocols for the analysis of natural and modified peptides"
@@ -189,6 +191,14 @@ A graphical example for the filling and capping functionalities is shown in the 
 
 The final function is the mutation, which allows the replacement of an amino acid by a non-natural monomer (NNAA). For this is relevant to have a PDB file of the monomer that will be included in the structure, as well as other parameters:
 
+**VILLINA VERSION** drawbacks: 
+- cannot deal with the NNAA once the atom ids order changed (Not following CA->->)
+- cannot deal with N-modification NNAA
+- cannot deal with thio-amide NNAA
+- not recording CONNECT info of NNAA
+- missing clashing check after mutation
+- need provide NNAA pdb file
+- cannot specify the name of output file 
 ```Python
 # Path to the input structure
 pdb_file = "../auxiliar/example_structure.pdb"
@@ -217,6 +227,41 @@ mut.get_NNAA_basic_info()
 mut.assign_mutation()
 ```
 
+**250314 VERSION**: 
+- fixed all the drawbacks listed in villina version
+- bugs: 
+    - thio-amide should be double-bonds
+    - cannot deal with raw starting structure contains CONNECT info
+```Python
+pdb_file = "../auxiliar/example_structure.pdb"
+chainID = "C"
+pepPosition = 2
+# Me-Tyr(OMe),CN[C@@H](Cc1ccc(OC)cc1)C(=O)O, a case failed before
+smilesNNAA = "CN[C@@H](Cc1ccc(OC)cc1)C(=O)O"
+# output the pdbNNAA file given smilesNNAA, but if you already have pdbNNAA you can ignore smilesNNAA
+pdbNNAA = "../auxiliar/tmp.pdb"
+chainNNAA = "A"
+nnaa_name = "MTM"
+# specify the output file
+output_pdb = "../auxiliar/mutated_structure.pdb"
+```
+
+Slightly differ from before:
+
+```Python
+while True:
+    try:
+        mut = Mutation(pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA, output_pdb)
+        mut.get_bb_dihedral()
+        mut.get_NNAA_basic_info()
+        mut.assign_mutation()
+        break
+    except:
+        # in case of failing to mutate
+        continue
+    
+```
+If you want to mutate several positions, you may use loop to go through one position at a time.
 ### 4. Interactions module
 
 For this module, a protein-peptide complex can be provided to detect different type of interactions. In addition, a function to map secondary structure elements of the peptide is included. First we import the module:
