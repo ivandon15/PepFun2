@@ -403,7 +403,7 @@ class Capping:
 
 class Mutation:
 
-    def __init__(self, pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA=None, mutated_file=None):
+    def __init__(self, pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA=None, mutated_file=None, ignore_pairs=None):
         '''
         Class to mutate a NNAA in a position of a natural AA
 
@@ -414,6 +414,7 @@ class Mutation:
         :param smilesNNAA: if NNAA's smiles is provided, then generate and save in pdbNNAA
         :param chainNNAA: chain of the NNAA PDB file
         :param nnaa_name: abbreviated name of the NNAA
+        :param ignore_pairs: a list of tuple pair(in order), should contains the position of cyclization, [(1,13), (3,13)]
         '''
 
         self.pdb_file = pdb_file
@@ -424,6 +425,7 @@ class Mutation:
         self.chainNNAA = "A"
         self.nnaa_name = nnaa_name
         self.mutated_file = "mutated_{}.pdb".format(self.nnaa_name) if not mutated_file else mutated_file
+        self.ignore_pairs = ignore_pairs
         self.BBS_FLG = False
 
     ########################################################################################
@@ -553,7 +555,7 @@ class Mutation:
 
     ########################################################################################
     # HACK
-    def check_clashes(self, pdb_file, chain_id, distance_threshold=2.1):
+    def check_clashes(self, pdb_file, chain_id, distance_threshold=2.1, ignore_pairs=None):
         '''
         Check for clashes between atoms in a specified chain and other atoms in the structure.
 
@@ -574,7 +576,7 @@ class Mutation:
         def is_backbone(atom_name):
             return atom_name in ["N", "CA", "C", "O"]
         
-        clash_pairs = []
+        clash_pairs = set()
         for chain in model:
             if chain.id != chain_id:
                 continue  
@@ -589,7 +591,9 @@ class Mutation:
                     for neighbor in neighbors:
                         if neighbor.get_parent() == residue:
                             continue
-                        clash_pairs.append([(residue.id[1], atom.get_name()), (neighbor.get_parent().id[1], neighbor.get_name())])
+                        pair = tuple(sorted((residue.id[1], neighbor.get_parent().id[1])))
+                        if not ignore_pairs or pair not in ignore_pairs:
+                            clash_pairs.add(pair)
         return clash_pairs
 
 
@@ -1089,8 +1093,9 @@ class Mutation:
         self.add_connect(self.mutated_file)
         if Chem.MolFromPDBFile(self.mutated_file) is None:
             raise Exception
-        clash_pairs = self.check_clashes(self.mutated_file, self.chainID)
+        clash_pairs = self.check_clashes(self.mutated_file, self.chainID, ignore_pairs=self.ignore_pairs)
         if clash_pairs:
+            # print(clash_pairs)
             raise Exception
 
     # End of Mutation class

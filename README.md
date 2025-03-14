@@ -244,6 +244,9 @@ chainNNAA = "A"
 nnaa_name = "MTM"
 # specify the output file
 output_pdb = "../auxiliar/mutated_structure.pdb"
+# If the input starting pdb is a cyclic peptide, you should specify the cyclic position
+# If not, you may ignore this param.
+ignore_pairs = [(1,13), (3,13)] # bicycle at P1 and P13, P3 and P13
 ```
 
 Slightly differ from before:
@@ -251,7 +254,7 @@ Slightly differ from before:
 ```Python
 while True:
     try:
-        mut = Mutation(pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA, output_pdb)
+        mut = Mutation(pdb_file, chainID, pepPosition, nnaa_name, pdbNNAA, smilesNNAA, output_pdb, ignore_pairs)
         mut.get_bb_dihedral()
         mut.get_NNAA_basic_info()
         mut.assign_mutation()
